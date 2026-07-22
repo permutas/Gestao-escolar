@@ -1,0 +1,135 @@
+import os
+import asyncio
+from datetime import datetime, timedelta
+import httpx
+from sqlalchemy import select, update
+from database import SessionLocal
+from models.assistencia import AssistenciaMutua
+from models.contactos_professores import ContactoProfessor
+
+
+# ==========================
+# 📩 Função para enviar SMS via API
+# ==========================
+async def enviar_sms_api(mensagem, numeros):
+    if not isinstance(numeros, list):
+        numeros = [numeros]
+
+    base_url = os.getenv("RENDER_EXTERNAL_URL", "http://127.0.0.1:8000")
+    url = f"{base_url}/sms/enviar"
+
+    payload = {
+        "sender_id": "PHANDIRA-2",
+        "mensagem": mensagem,
+        "numeros": numeros
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(url, json=payload)
+            if resp.status_code == 200:
+                print(f"✅ SMS enviado: {numeros}")
+                return True
+            else:
+                print(f"❌ Erro SMS: {resp.text}")
+                return False
+        except Exception as e:
+            print(f"⚠️ Exception ao enviar SMS: {e}")
+            return False
+
+
+# ==========================
+# 🔄 Monitor de assistências (EXECUÇÃO ÚNICA)
+# ==========================
+async def monitorar_assistencias():
+    print("🔄 Execução do monitor de assistências")
+
+    agora = datetime.now()
+    print(f"\n📅 Verificação em: {agora}")
+
+    async with SessionLocal() as db:
+        result = await db.execute(
+            select(AssistenciaMutua)
+            .where(AssistenciaMutua.status_aprovacao == "APROVADO")
+        )
+        assistencias = result.scalars().all()
+
+        print(f"📊 Total de assistências encontradas: {len(assistencias)}")
+
+        for a in assistencias:
+
+            # Se aula já passou, ignora
+            if agora >= a.data_hora:
+                print(f"⚠️ Assistência já passou (ID {a.id})")
+                continue
+
+            # Só envia um dia antes
+            dia_envio = (a.data_hora - timedelta(days=1)).date()
+
+            if agora.date() != dia_envio:
+                continue
+
+            # ==========================
+            # Buscar professor assistido
+            # ==========================
+            result_assistido = await db.execute(
+                select(ContactoProfessor)
+                .where(ContactoProfessor.nome == a.professor_assistido_nome)
+            )
+            professor_assistido = result_assistido.scalars().first()
+
+            # ==========================
+            # Buscar professor assistente
+            # ==========================
+            result_assistente = await db.execute(
+                select(ContactoProfessor)
+                .where(ContactoProfessor.nome == a.professor_assistente_nome)
+            )
+            professor_assistente = result_assistente.scalars().first()
+
+            # ==========================
+            # Enviar SMS
+            # ==========================
+            if professor_assistido:
+                mensagem_assistido = (
+                    f"Saudacoes, amanha dia {a.data_hora.strftime('%d/%m/%Y')} "
+                    f"tera uma assistencia de aula na disciplina de {a.disciplina} "
+                    f"pelas {a.data_hora.strftime('%H:%M')}h, "
+                    f"pelo professor {a.professor_assistente_nome}. Bom trabalho."
+                )
+                await enviar_sms_api(mensagem_assistido, [professor_assistido.telefone])
+                await asyncio.sleep(2)
+
+            if professor_assistente:
+                mensagem_assistente = (
+                    f"Saudacoes, amanha dia {a.data_hora.strftime('%d/%m/%Y')} "
+                    f"pela {a.data_hora.strftime('%H:%M')}h, devera efectuar uma "
+                    f"assistencia de aula de {a.disciplina}, na {a.classe} classe, "
+                    f"turma {a.turma}, ao professor {a.professor_assistido_nome}, "
+                    f"na sala numero {a.numero_sala}, localizada na {a.localizacao_sala}."
+                )
+                await enviar_sms_api(mensagem_assistente, [professor_assistente.telefone])
+                await asyncio.sleep(2)
+
+            # ==========================
+            # Atualizar status
+            # ==========================
+            await db.execute(
+                update(AssistenciaMutua)
+                .where(AssistenciaMutua.id == a.id)
+                .values(status_aprovacao="NAO")
+            )
+            await db.commit()
+
+            print(f"✅ Processado e atualizado (ID {a.id})")
+
+
+# ==========================
+# MAIN
+# ==========================
+async def main():
+    await monitorar_assistencias()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
